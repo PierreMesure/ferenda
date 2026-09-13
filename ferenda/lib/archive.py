@@ -13,7 +13,10 @@ Four separate ceilings, because they fail in different ways:
   * ``max_members``   -- an archive of a million tiny files exhausts the walk
     rather than memory.
   * ``max_member_bytes`` -- one member no reader has room for.
-  * ``max_total_bytes``  -- many members that are each acceptable.
+  * ``max_total_bytes``  -- many members that are each acceptable. Sized for
+    what an archive *declares*, not for what a caller reads: no caller here
+    expands a whole archive, so this is the outer bound, and the per-member
+    ceiling below is what each actual read is held to.
   * ``max_ratio``     -- the compression ratio a zip bomb needs; a legitimate
     XML/PDF bundle stays far under it.
 
@@ -28,7 +31,16 @@ from .errors import UpstreamChanged
 
 MAX_MEMBERS = 4096
 MAX_MEMBER_BYTES = 256 * 1024 * 1024
-MAX_TOTAL_BYTES = 512 * 1024 * 1024
+# 2 GB, from what the corpus declares: an OJ Formex bundle ships the act's
+# facsimile pages beside its XML, and the largest today (32024R1679's 2024-06-28
+# consolidation) declares 1 374 MB of members for 0.5 MB of XML. At 512 MB the
+# budget refused 85 consolidations of four acts (32008R0798, 32010R0206,
+# 32006R1791, 32007R0829: 619-833 MB) over TIFF members no reader opens --
+# `formex.formex_members` reads the `.xml` members and nothing else, and the
+# other two callers read one named member each. What an over-declaring archive
+# can still cost is bounded where it is paid: `max_member_bytes` caps each read
+# and `max_ratio` refuses the compression a bomb needs.
+MAX_TOTAL_BYTES = 2048 * 1024 * 1024
 # Formex XML compresses about 8:1 and a .docx about 5:1; 200 leaves four
 # orders of headroom over that and still refuses the shapes a bomb needs
 MAX_RATIO = 200
