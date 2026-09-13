@@ -35,6 +35,9 @@ VOCAB = {
         "article": "Article",
         "headings": ("TITLE", "CHAPTER", "PART", "SECTION", "SUBSECTION",
                      "ANNEX", "APPENDIX"),
+        "divisions": ("PART", "TITLE", "CHAPTER", "SECTION", "SUBSECTION"),
+        "divisions_definite": (),
+        "contents": ("table of contents", "contents"),
         "annex": ("ANNEX", "APPENDIX"),
         "enacting": r"HA(?:S|VE) (?:ADOPTED|DECIDED|DRAWN UP|AGREED)",
         "visa": ("having regard", "having seen"),
@@ -61,6 +64,12 @@ VOCAB = {
         "article": "Artikel",
         "headings": ("AVDELNING", "KAPITEL", "DEL", "AVSNITT", "UNDERAVSNITT",
                      "BILAGA", "TILLÄGG"),
+        "divisions": ("DEL", "AVDELNING", "KAPITEL", "AVSNITT", "UNDERAVSNITT"),
+        # the same divisions as the treaties designate them, in the definite
+        # form with the ordinal in front: "FÖRSTA DELEN", "ANDRA AVDELNINGEN"
+        "divisions_definite": ("DELEN", "AVDELNINGEN", "KAPITLET", "AVSNITTET",
+                               "UNDERAVSNITTET"),
+        "contents": ("innehållsförteckning", "innehåll"),
         "annex": ("BILAGA", "TILLÄGG"),
         "enacting": r"HÄR(?:IGENOM|MED) (?:FÖRESKRIVS|BESLUTAS|FATTAS|ANTAS)",
         "visa": ("med beaktande av",),
@@ -84,6 +93,12 @@ VOCAB = {
         "decision_date": r"\b(?:den )?\d{1,2} \w+ \d{4}\b",
     },
 }
+
+# what may follow a division's designator word and still leave it a bare
+# designation past the two-word form: a numeral ("1", "IVa") or the letter an
+# inserted division carries ("KAPITEL 6 a")
+RE_DESIGNATION_NUMBER = re.compile(r"(?:[\dIVXLCM]+[a-z]?|[a-zA-Z])", re.I)
+
 
 # language-neutral structural markers (parenthesised numbers/letters, numerals)
 RE_RECITAL = re.compile(r"^\(\s*(\d+)\s*\)$")
@@ -271,6 +286,18 @@ class Vocab:
             r"(?:%s\s+%s.*|(?:\s+(?!\(\s*\d)%s.*)?)$"
             % (spec["article"], _ART_MARKERS, _RUBRIC_WORD, _RUBRIC_OPEN))
         self.heading = re.compile(r"^(?:%s)\b" % "|".join(spec["headings"]), re.I)
+        # the division words the act nests by, outermost first. The class-ful OJ
+        # HTML does not encode depth -- a Kapitel inside an Avdelning and the
+        # Avdelning itself are both `ti-section-1` -- so the designator word is
+        # the only thing that says which sits under which.
+        self._divisions = tuple(w.lower() for w in spec["divisions"])
+        # the same words in the definite form, at the same ranks: a treaty
+        # designates its parts "FÖRSTA DELEN", not "DEL I", and the designator
+        # is then the last word rather than the first
+        self._definite = tuple(w.lower() for w in spec["divisions_definite"])
+        # the heading over a document's own printed table of contents, which is
+        # navigation the page rebuilds and not text of the act
+        self.contents = re.compile(r"^(?:%s)$" % "|".join(spec["contents"]), re.I)
         self.annex = re.compile(r"^(?:%s)\b" % "|".join(spec["annex"]), re.I)
         # the bare words, for `annex_strip`'s segment pick (a prefix test, not a
         # pattern match -- the strip's segments are already isolated)
@@ -325,6 +352,36 @@ class Vocab:
         RIMVYDAS NORKUS"), false for a court's, whose title runs on into the
         parties."""
         return opener.lower().endswith(self._decision_name)
+
+    def bare_designation(self, text):
+        """Whether `text` is a designation and nothing else -- "AVDELNING I",
+        "KAPITEL 1", "FÖRSTA DELEN" -- as against a division heading that
+        carries its title on the same line ("KAPITEL II Skyddsåtgärder"). Only
+        a bare one takes the line after it as its title."""
+        words = [w for w in text.split(" ") if w] if text else []
+        if not words:
+            return False
+        if words[0].lower().strip(".:") in self._divisions:
+            # the designation and its number, however the act spells the number
+            # ("AVDELNING I", "DEL ETT", "PART ONE"), or a longer form whose
+            # every remaining word is a numeral ("KAPITEL 6 a")
+            return len(words) <= 2 or all(
+                RE_DESIGNATION_NUMBER.fullmatch(w) for w in words[1:])
+        # the definite form is the ordinal and the word, and nothing else
+        return len(words) == 2 and words[-1].lower().strip(".:") in self._definite
+
+    def division_rank(self, text):
+        """The depth the designator opening `text` names: 1 for the outermost
+        ("DEL"/"PART"), 5 for the innermost ("UNDERAVSNITT"/"SUBSECTION"). None
+        when `text` opens with no division word, which is what tells the HTML
+        parser it is looking at a title rather than a designation."""
+        words = [w.lower().strip(".:") for w in text.split(" ") if w] if text \
+            else []
+        if words and words[0] in self._divisions:
+            return self._divisions.index(words[0]) + 1
+        if words and words[-1] in self._definite:
+            return self._definite.index(words[-1]) + 1
+        return None
 
     def is_marker(self, text):
         """A short left-cell that signals a structural table row (heading /

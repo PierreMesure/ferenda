@@ -189,6 +189,13 @@ def _heading_level(role):
     return int(match.group(1)) if match else 1
 
 
+def _next_section(role):
+    """The class the OJ gives a division heading's *title* line, one step under
+    `role`: `ti-section-1` sets the designation, `ti-section-2` the title."""
+    match = re.search(r"^(.*-)(\d+)$", role)
+    return "%s%d" % (match.group(1), int(match.group(2)) + 1) if match else ""
+
+
 RE_EU_DATE = re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b")
 
 
@@ -209,7 +216,7 @@ def _oj(text):
     return "%s %s" % (match.group(1), match.group(2)) if match else (text or None)
 
 
-def _emit_structural_row(marker, text, blocks, in_body, voc):
+def _emit_structural_row(marker, text, blocks, in_body, voc, depth):
     if voc.article.match(marker):
         # the marker is the designation, the text its title -- kept apart, the
         # way the Formex parser keeps TI.ART and STI.ART apart
@@ -217,7 +224,8 @@ def _emit_structural_row(marker, text, blocks, in_body, voc):
         blocks.append(Block("article", text or "", num=num, anchor=num,
                             label=marker))
     elif voc.heading.match(marker):
-        blocks.append(Block("heading", normalize_space(text or ""), level=1,
+        blocks.append(Block("heading", normalize_space(text or ""),
+                            level=_level(marker, voc, depth),
                             label=normalize_space(marker)))
     elif (m := L.RE_RECITAL.match(marker)):
         num = m.group(1)
@@ -226,10 +234,10 @@ def _emit_structural_row(marker, text, blocks, in_body, voc):
         blocks.append(Block("point", text, num=m.group(1)))
     else:                                   # roman/number heading marker
         blocks.append(Block("heading", normalize_space("%s %s" % (marker, text)),
-                            level=1))
+                            level=depth.under()))
 
 
-def _emit_table(table, blocks, in_body, voc):
+def _emit_table(table, blocks, in_body, voc, depth):
     rows = [cells for cells in
             (tr.find_all(["td", "th"]) for tr in table.find_all("tr")) if cells]
     if rows and all(len(r) == 2 for r in rows):
@@ -237,7 +245,7 @@ def _emit_table(table, blocks, in_body, voc):
         if markers and all(voc.is_marker(m) for m in markers):
             for cells in rows:
                 _emit_structural_row(_flat(cells[0]), _flat(cells[1]),
-                                     blocks, in_body, voc)
+                                     blocks, in_body, voc, depth)
             return
     out = []
     for cells in rows:                       # real data table -> one tabell block
@@ -258,6 +266,129 @@ def _emit_table(table, blocks, in_body, voc):
 # a `<p>` containing any of these is a wrapper produced by the parser, not a
 # real paragraph -- see the skip in the body loop
 BLOCK_WRAPPED = ("txt_te", "table", "p")
+
+# a designation is a line, not a sentence: "PROTOKOLL (nr 1)", "AVDELNING V".
+# Past this the line is the heading's own title and carries no title after it.
+DESIGNATION_MAX = 40
+
+
+def _printed_contents(elements, voc):
+    """The elements of the document's own printed table of contents: the
+    `ti-tbl` heading that names it and the unbroken run of tables under it.
+
+    A consolidated treaty prints its contents as 121 one-row tables, each a
+    heading and a page number, and they parsed as 121 `tabell` blocks at the
+    top of the body -- navigation the page already builds from the structure,
+    and page numbers that mean nothing on a web page. The run ends at the first
+    element that is not a table (the treaty's own INGRESS), so a document with
+    no printed contents loses nothing."""
+    skip, found = set(), False
+    for el in elements:
+        if found:
+            if el.name != "table":
+                break
+            skip.add(id(el))
+        elif _role(el) == "ti-tbl" and voc.contents.match(_flat(el)):
+            # `index`/`in` on a list of elements compares tags by *equality*,
+            # and two rows of identical markup are equal, so the walk carries
+            # its own found flag and the ids it collects are identities
+            found = True
+            skip.add(id(el))
+    return frozenset(skip)
+
+
+def _level(text, voc, depth, step=1):
+    """The level a heading sits at: under the division its designator ranks
+    beneath ("KAPITEL 1" inside "AVDELNING V"), beside the divisions when it is
+    an annex, and one step inside whatever is open when it names no designator
+    at all."""
+    if voc.annex.match(text):
+        return depth.annex()
+    rank = voc.division_rank(text)
+    return depth.division(rank) if rank else depth.under(step)
+
+
+def _numbered(designation):
+    """Whether a section designation names one member of its section --
+    "Protokoll (nr 1)" against the "PROTOKOLL" that opens them."""
+    return bool(re.search(r"\d", designation))
+
+
+def _title_groups(lines):
+    """A run of title-classed lines split into the headings it holds.
+
+    The OJ prints a section and its first member as one unbroken run --
+    "PROTOKOLL", "PROTOKOLL (nr 1)", "OM DE NATIONELLA PARLAMENTENS ROLL I
+    EUROPEISKA UNIONEN" -- where the run's other members print as pairs. A line
+    that repeats the run's opening word opens a heading of its own; every other
+    line continues the one before it, which is how the declarations' three-line
+    title stays one heading."""
+    opener = lines[0].split(" ")[0]
+    groups = [[lines[0]]]
+    for line in lines[1:]:
+        if line.split(" ")[0] == opener:
+            groups.append([line])
+        else:
+            groups[-1].append(line)
+    return groups
+
+
+class _Depth:
+    """The level an OJ-HTML heading sits at.
+
+    The class-ful OJ HTML does not encode depth. Every division heading is
+    `ti-section-1` whether it is an Avdelning or a Kapitel inside one, and a
+    consolidated treaty prints its protocols and declarations as `doc-ti`
+    sections that carry divisions of their own. Depth comes from two things:
+    the designator word's rank (`Vocab.division_rank`) and the document section
+    the heading sits in.
+
+    12016M/TXT (FEU) is the shape this serves: "PROTOKOLL" opens a section (1),
+    "Protokoll (nr 1)" is one protocol in it (2), and that protocol's own
+    "AVDELNING I" sits under it (3) rather than beside the treaty's own."""
+
+    def __init__(self):
+        self.base = 0        # the level divisions nest under (0: the document)
+        self.section_base = 0  # ... and the level of the open document section
+        self.opener = 0      # the level of the last section opener
+        self.stack = []      # the open divisions, as (rank, level)
+
+    def section(self, numbered):
+        """A `doc-ti` heading in the body. A designation with a number in it is
+        one member of the open section ("Protokoll (nr 1)"); one without opens
+        a section ("PROTOKOLL", "FÖRKLARINGAR"). Either closes every division:
+        a protocol's Avdelning I ends at the next protocol."""
+        self.stack = []
+        level = self.opener + 1 if numbered and self.opener else 1
+        if not numbered:
+            self.opener = level
+        self.base = self.section_base = level
+        return level
+
+    def annex(self):
+        """An annex heading. An annex is not inside the act's divisions -- it
+        follows them -- so it closes every one and sits directly inside the
+        document section around it (protocol 3's Bilaga I is the Court's own,
+        not a thirty-eighth protocol). What the annex holds then nests under
+        it."""
+        self.stack = []
+        self.base = self.section_base + 1
+        return self.base
+
+    def division(self, rank):
+        """A division heading, by its designator's rank: it closes every open
+        division at its own rank or deeper, and nests under what is left."""
+        while self.stack and self.stack[-1][0] >= rank:
+            self.stack.pop()
+        level = (self.stack[-1][1] if self.stack else self.base) + 1
+        self.stack.append((rank, level))
+        return level
+
+    def under(self, step=1):
+        """A heading with no designator to rank -- a `ti-grseq` sub-heading, a
+        section title the act writes out in full: one step inside whatever is
+        open."""
+        return (self.stack[-1][1] if self.stack else self.base) + step
 
 
 def parse_html(markup, celex, lang):
@@ -309,13 +440,20 @@ def parse_html(markup, celex, lang):
     in_body = in_caselaw = doc.doctype in CASELAW
     in_recitals = False                      # the recital list has been opened
     expected = 1                             # the next recital marker in sequence
-    for el in body.find_all(["p", "table"]):
-        if el.find_parent("table") is not None:
-            continue                         # cell content handled with the table
+    depth = _Depth()
+    elements = [el for el in body.find_all(["p", "table"])
+                if el.find_parent("table") is None]
+    contents = _printed_contents(elements, voc)
+    index = 0
+    while index < len(elements):
+        el = elements[index]
+        index += 1
+        if id(el) in contents:
+            continue                         # the document's own printed TOC
         if el.name == "table":
             if el.find(class_=re.compile(r"^(oj-)?hd-")) is not None:
                 continue                     # the OJ header strip (metadata)
-            _emit_table(el, doc.body, in_body, voc)
+            _emit_table(el, doc.body, in_body, voc, depth)
             continue
         if el.find(BLOCK_WRAPPED) is not None:
             # a `<p>` that turns out to *contain* block-level content is a
@@ -333,10 +471,34 @@ def parse_html(markup, celex, lang):
             # The children are walked next either way, so nothing is lost.
             continue
         role = _role(el)
-        if role in HEADER or role in TITLE:
+        if role in HEADER:
             continue
         text = _flat(el)
         if not text:
+            continue
+        if role in TITLE:
+            if not in_body:
+                continue                     # the document's own title block
+            # a title-classed line inside the body opens a document section: a
+            # treaty marks its protocols and its declarations this way and no
+            # other, and skipping them left 37 protocols and 65 declarations in
+            # the artifact as headless runs of articles. The OJ prints such a
+            # heading over several lines -- "PROTOKOLL (nr 1)" then "OM DE
+            # NATIONELLA PARLAMENTENS ROLL I EUROPEISKA UNIONEN" -- so the run
+            # is read whole, the way a division's two lines are below.
+            lines = [text]
+            while index < len(elements) and _role(elements[index]) in TITLE \
+                    and (line := _flat(elements[index])):
+                lines.append(line)
+                index += 1
+            for group in _title_groups(lines):
+                label = group[0] if len(group) > 1 \
+                    and len(group[0]) <= DESIGNATION_MAX else None
+                doc.body.append(Block(
+                    "heading", " ".join(group[1:] if label else group),
+                    level=(depth.annex() if voc.annex.match(group[0])
+                           else depth.section(_numbered(group[0]))),
+                    label=label))
             continue
         # `ti-art` marks an article; with no semantic class (old txt_te HTML) a
         # short line that is itself "Article N" / "Artikel N" is one too -- but a
@@ -355,14 +517,30 @@ def parse_html(markup, celex, lang):
             else:
                 doc.body.append(Block("heading", text, level=2))
         elif role.startswith("ti-"):
-            doc.body.append(Block("heading", text, level=_heading_level(role)))
+            # a division heading the OJ prints as two lines -- "AVDELNING I"
+            # (ti-section-1) and "GEMENSAMMA BESTÄMMELSER" (ti-section-2) --
+            # is one heading, its designation kept apart from its title the way
+            # Formex keeps TI and STI apart. Read flat they were two entries,
+            # a bare "AVDELNING I" and a title with nothing to say which act
+            # division it named.
+            bare = len(text) <= DESIGNATION_MAX and voc.bare_designation(text)
+            label = None
+            if bare and index < len(elements) \
+                    and _role(elements[index]) == _next_section(role) \
+                    and (title := _flat(elements[index])):
+                label, text = text, title
+                index += 1
+            doc.body.append(Block(
+                "heading", text,
+                level=_level(label or text, voc, depth, _heading_level(role)),
+                label=label))
         elif not role and voc.heading.match(text) and (text.isupper() or len(text) <= 40):
-            doc.body.append(Block("heading", text, level=1))
+            doc.body.append(Block("heading", text, level=_level(text, voc, depth)))
         elif not role and (annex := L.annex_strip(text, voc.annex_words)):
             # the pre-2000 multilingual annex strip: one line naming the annex in
             # every language edition, so `voc.heading` (anchored on this
             # document's language) never sees its own word at the front
-            doc.body.append(Block("heading", annex, level=1))
+            doc.body.append(Block("heading", annex, level=depth.annex()))
         elif role == "note":
             doc.body.append(Block("note", text))
         elif role == "signatory" or (not role and voc.signature.match(text)):
