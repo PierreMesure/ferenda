@@ -19,6 +19,47 @@ def _zip(members, **kwargs):
     return buf
 
 
+class _Directory:
+    """A zip directory with no bytes behind it -- `check` reads `infolist()`
+    and expands nothing, so a budget over gigabytes can be tested for what it
+    costs to declare rather than for what it costs to write."""
+
+    def __init__(self, infos):
+        self._infos = infos
+
+    def infolist(self):
+        return self._infos
+
+
+def _members(sizes, ratio=15):
+    infos = []
+    for i, size in enumerate(sizes):
+        info = zipfile.ZipInfo("L_2010073SV.010001%02d" % i)
+        info.file_size = size
+        info.compress_size = size // ratio
+        infos.append(info)
+    return _Directory(infos)
+
+
+def test_an_oj_bundle_of_facsimile_pages_fits_the_budget():
+    """32010R0206's consolidation: 93 members declaring 833 MB, of which the
+    Formex reader opens 0.4 MB of XML and never touches the OJ page scans.
+    At the old 512 MB total the bundle was refused whole, and 85
+    consolidations of four acts failed every run they were dispatched in."""
+    bundle = _members([10 * 1024 * 1024] * 83 + [100 * 1024] * 10)
+    archive.check(bundle)                       # the default budgets admit it
+    with pytest.raises(archive.ArchiveTooLarge, match="bytes of members"):
+        archive.check(bundle, max_total_bytes=512 * 1024 * 1024)
+
+
+def test_the_raised_total_still_refuses_a_bomb_and_an_outsized_member():
+    # the two ceilings that bound what a read actually costs are unchanged
+    with pytest.raises(archive.ArchiveTooLarge, match="expands"):
+        archive.check(_members([100 * 1024 * 1024], ratio=1000))
+    with pytest.raises(archive.ArchiveTooLarge, match="declares"):
+        archive.check(_members([archive.MAX_MEMBER_BYTES + 1]))
+
+
 def test_a_zip_bomb_shape_is_refused_before_a_byte_expands():
     # 8 MB of one repeated byte deflates to a few kB -- the ratio a bomb needs
     bomb = _zip({"payload": b"\0" * (8 * 1024 * 1024)},

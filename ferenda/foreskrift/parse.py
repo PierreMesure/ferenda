@@ -31,7 +31,7 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup, NavigableString
 
-from ..lib import begrepp, compress, tabell
+from ..lib import begrepp, compress, datasets, tabell
 from ..lib.artifact import footnote_nodes
 from ..lib.lagrum import (
     EULAGSTIFTNING,
@@ -48,6 +48,7 @@ from ..lib.pdftext import (
     RE_KAP_MARK,
     RE_PARA_MARK,
     Para,
+    ocr_pdf,
     page_paragraphs,
     pdf_pages,
     ruled_footnotes,
@@ -165,9 +166,120 @@ def stodav_clause(text):
     return window[:end.start()] if end else window
 # active masthead form ("ersätter/upphäver …") and the transitional-provision
 # passive ("Genom föreskrifterna upphävs … (PMFS 2019:2)")
-RE_ERSATTER = re.compile(r"\b(?:ersätter|upphäv(?:er|s))\b(.*?)(?:\.|$)",
+# -- not "upphävs genom SJVFS 2021:13", the register's stamp on a repealed
+# document's own PDF (it names the document's repealer, and a föreskrift
+# never states its own repeal), and not "upphör att gälla", whose target
+# stands before the verb (RE_UPPHOR_BEFORE) while what follows names the
+# successor ("upphör att gälla vid ikraftträdandet av … (SJVFS 1994:22)")
+# The capture ends at a sentence end: a full stop before a capital or, once
+# RE_ENUMERATOR has run, an item dash ("… om hållande av hund och katt. 2.
+# Bestämmelserna …", SJVFS 2020:8); "a." and "b." are item markers (SJVFS
+# 2019:71), like "saknr." and "m.m." not sentence ends.
+# The verb is prose, so never all capitals: "UPPHÄVS" alone is the register's
+# stamp again, split from its "GENOM" line (SJVFS 2012:24).
+RE_ERSATTER = re.compile(r"\b(?-i:[eE]rsätter|[uU]pphäv(?:er|s)(?!\s+[gG][eE][nN][oO][mM]\b)|[uU]pphör(?!\s+(?:att\s+)?gälla))\b"
+                         r"(.{0,600}?)(?:(?<!saknr)(?<!\bnr)(?<!kap)(?<!m\.m)(?<!\s[a-zåäö])\.\s+(?=[A-ZÅÄÖ−])|$)",
                          re.DOTALL | re.I)
-RE_FS_REF = re.compile(r"\b([A-ZÅÄÖ]+-?(?:FS|FA))\s*(\d{4}):(\d+)")
+# the target *before* the verb, in an ikraftträdande sentence: "träder i kraft
+# den 28 februari 2003, då Livsmedelsverkets föreskrifter (SLVFS 1993:18) om
+# material … upphör att gälla" (LIVSFS 2003:2). Bounded by the sentence, whose
+# colons are only the numbers' own.
+# an enumerator inside a repeal sentence ("upphävs 1. Livsmedelsverkets
+# föreskrifter (1993:21) …, 2. …", LIVSFS 2014:4) is not the sentence's end;
+# it becomes a dash item marker, which `_repeal_object` splits on
+# (not the tail of a designation: "SJVFS 2021:13.\nGodkänd" is a footnote's end)
+RE_ENUMERATOR = re.compile(r"(?<![:\d/])\b\d{1,2}\.\s+(?=[A-ZÅÄÖ(\d])")
+RE_SKALL_UPPHORA = re.compile(r"\bska(?:ll)?\s+([^.;]{0,300}?)\s+upphöra\s+att\s+gälla", re.DOTALL | re.I)
+# ("upphör gälla", SJVFS 2019:6, drops the "att")
+RE_UPPHOR_BEFORE = re.compile(r"([^;]{0,2500}?)\b(?:upphör|ska(?:ll)?\s+upphöra)\s+(?:att\s+)?gälla",
+                              re.DOTALL | re.I)
+# where that sentence starts: the last full stop followed by a capital
+# ("m.m." and "t.o.m." are not sentence ends)
+RE_SENTENCE_START = re.compile(r"(?<!saknr)(?<!\bnr)(?<!kap)(?<!m\.m)(?<!\s[a-zåäö])\.\s+(?=[A-ZÅÄÖ−])")
+# a repeal of a *provision* names one before the regulation: "att 17 § verkets
+# föreskrifter (LIVSFS 2005:20) … ska upphöra att gälla" (LIVSFS 2011:8),
+# "bilaga 2 till …", "övergångsbestämmelserna till …" -- the regulation stays
+RE_PROVISION = re.compile(r"\d+\s*§|§§|\bbilag|\bpunkt(?:en|erna)?\b|övergångsbestämmelse", re.I)
+# the amending formula's own "att": "i fråga om verkets föreskrifter (SJVFS
+# 2017:44) om …, dels att 3 § ska upphöra att gälla" (SJVFS 2024:4) repeals a
+# provision; the object is what the last such "att" introduces
+RE_ATT_PROVISION = re.compile(r"\b(?:dels\s+)?att\s+(?=\d|bilag|rubrik|punkt|övergångs)", re.I)
+# a page foot's footnote lines, which land inside the sentence when no rule
+# separates them: "… gödsel m.m.\n6 SJVFS 2004:62 7 SJVFS 2005:74" after the
+# object (SJVFS 2010:1), "\n3 SJVFS 1994:23. 4 Föreskrifterna upphör att gälla"
+# before the verb (SJVFS 2000:105)
+RE_FOOTNOTE_LINE = re.compile(r"(?:\n|\.\s+)\d{1,3}\s+(?=[A-ZÅÄÖ])")
+
+
+def _repeal_object(segment, whole=False, tail=False):
+    """The regulations a repeal sentence's object names, item by item, or
+    nothing for an item that is a provision of one. An enumerated object
+    ("upphävs 1. 2 kap. 1 § … (SJVFS 2002:98), 2. … (SJVFS 2012:24)",
+    SJVFS 2026:3) is read per item, each cut at "om ändring i". Except for a
+    list, the object is first cut to its own sentence and to the subordinate
+    clause after "då" (an omtryck reprints its base's entry-into-force
+    sentence, whose "då …" clause names what that base repealed), and off any
+    footnote line the page foot put inside it -- keeping the part next to the
+    verb: the first when the verb opens the object, the last (`tail`) when the
+    object stands before "ska upphöra att gälla"."""
+    if not whole:
+        segment = RE_ATT_PROVISION.split(
+            RE_SENTENCE_START.split(segment)[-1].rsplit(" då ", 1)[-1])[-1]
+        segment = RE_FOOTNOTE_LINE.split(segment)[-1 if tail else 0]
+    kept = []
+    for i, item in enumerate(RE_UPPHOR_ITEM.split(segment)):
+        item = RE_ANDRING.split(item)[0]
+        first = RE_FS_REF.search(item) or RE_BARE_OWN_REF.search(item)
+        if first and RE_PROVISION.search(item[:first.start()]):
+            continue
+        # a list item names one regulation; what follows its designation is
+        # the title, or page furniture ("12 SJVFS 2021:10.", a footnote at the
+        # page foot, lands inside SJVFS 2025:10's item for SJVFS 2009:3)
+        kept.append(item[:first.end()] if first and (whole or i) else item)
+    return " ".join(kept)
+# an enumerator inside a repeal sentence ("upphävs 1. Livsmedelsverkets
+# föreskrifter (1993:21) …, 2. …", LIVSFS 2014:4) is not the sentence's end
+# the list form: "följande föreskrifter ska upphöra att gälla den 1 januari
+# 2006: − Livsmedelsverkets föreskrifter (SLVFS 1978:21) om …, − …" (LIVSFS
+# 2005:24), "Nedanstående föreskrifter upphör att gälla enligt följande. 1. …"
+# (LIVSFS 2012:4). The items run to the next blank line, the entry-into-force
+# sentence or the signature rule; each item is cut at "om ändring i" like a
+# title, so repealing an amendment leaves its base regulation alone.
+RE_UPPHOR_LIST = re.compile(
+    r"(?:följande|nedanstående)\s+(?:föreskrifter|allmänna\s+råd|författningar|kungörelser)\b"
+    r"[^:]{0,160}?(?:upphävs|upphöra\s+att\s+gälla|upphör\s+att\s+gälla)[^:]{0,160}?"
+    r"(?::|nämligen|enligt\s+följande\.)\s*(.{0,4000}?)"
+    r"(?=\n\s*\n|Dessa\s+föreskrifter\s+träder|_{5,}|$)", re.DOTALL | re.I)
+RE_UPPHOR_ITEM = re.compile(r"\s(?=(?:\d{1,2}\.|[a-zåäö][.)]|[−•–-])\s)")
+# the enumerated passive: "Genom författningen upphävs 1. Statens jordbruksverks
+# föreskrifter (SJVFS 1999:102) om …, 2. … (SJVFS 2002:98) om …" (SJVFS 2021:48,
+# twelve items; SJVFS 2026:8 has seventeen a)–q) items), read after
+# RE_ENUMERATOR has turned the numbers into item dashes. It is one sentence,
+# far longer than RE_ERSATTER's window, and crosses page breaks: a full stop
+# ends it only when no item marker follows within the next few lines (a page
+# foot's footnote, "92 SJVFS 2021:13.", sits between items m) and n)), or
+# when the next line is an entry-into-force sentence (an omtryck prints its
+# amendments' "1. Denna författning träder i kraft …" points right after).
+RE_UPPHAVS_LIST = re.compile(
+    r"\bupphävs\s+(?:respektive\s+upphör\s+att\s+gälla\s+)?(?=(?:−|[a-zåäö][.)])\s)(.{0,6000}?)"
+    r"(?:(?<!m\.m)(?<!\s[a-zåäö])\.\s*\n(?!(?:[^\n]*\n){0,4}\s*(?:−|[a-zåäö][.)])\s)"
+    r"|\n(?=[^\n]*\bträder\s+i\s+kraft\b)|\n\s*\n|$)", re.DOTALL | re.I)
+# the decision form of a pure repeal, where the target precedes the verb:
+# "Konkurrensverket beslutar att Konkurrensverkets allmänna råd (KKVFS 2015:2)
+# om näringsförbud … ska upphöra att gälla den 1 mars 2021." (KKVFS 2021:2)
+RE_UPPHORA = re.compile(r"\b(?:beslutar|föreskriver)\b.{0,200}?\batt\b(.*?)\bska(?:ll)?\s+upphöra\s+att\s+gälla",
+                        re.DOTALL | re.I)
+# a förteckning över gällande föreskrifter, the list 18 c § författnings-
+# samlingsförordningen (1976:725) has an agency publish (LIVSFS 2007:1, whose
+# masthead is that very line; SLVFS 1997:3, OCR'd as "fö rteckningar")
+RE_FORTECKNING = re.compile(r"\bf[öo]\s?rteckning(?:en|ar)?\s+över\s+(?:gällande\s+)?(?:föreskrifter|författningar)"
+                            r"|18\s*c\s*§\s*författningssamlingsförordningen", re.I)
+# noun form in a title ("föreskrift om upphävande av … (BOLFS 2006:1)")
+RE_UPPHAVANDE = re.compile(r"\bupphävande\s+av\b(?!\s+vissa\s+(?:regler|bestämmelser|delar)\b|\s+\d+\s*§)(.*?)(?:\.|$)",
+                           re.DOTALL | re.I)
+# NFS/TFS … ELSÄK-FS; the pre-2002 Livsmedelsverket masthead prints "SLV FS
+# 1996:1" with a space, which `_fs_key` folds away like the hyphen
+RE_FS_REF = re.compile(r"\b([A-ZÅÄÖ]+(?:-| )?(?:FS|FA))\s*(\d{4}):(\d+)")
 # an ändringsförfattning's own title names its target: "… föreskrifter om
 # ändring i <agency>s föreskrifter (ÅFS 2005:5) om …". Some agencies drop
 # their own series designation in the parenthesis ("föreskrifter (2007:12)");
@@ -184,8 +296,18 @@ RE_ANDRING = re.compile(r"ändring(?:ar)?\s+(?:i|av)\b", re.IGNORECASE)
 # mastheads phrase it that way.
 RE_AMENDING_FORMULA = re.compile(
     r"föreskriver\b.{0,160}?\bi\s+fråga\s+om\b", re.IGNORECASE | re.DOTALL)
+# the designation printed right after the type word, where a title states
+# the document's own number -- or, in an omtryck, its base's
+RE_TITLE_DESIGNATION = re.compile(
+    r"(?:föreskrifter|allmänna\s+råd|kungörelse)\s*\(([A-ZÅÄÖ]+(?:-| )?FS)\s*(\d{4}):(\d+)\)")
+# Bare "allmänna råd (2005:1)" is not one: Jordbruksverket numbered its
+# allmänna råd in a series of their own ("Statens jordbruksverks allmänna råd
+# (2005:1) om lagring och spridning av gödsel", repealed by SJVFS 2013:40,
+# is not SJVFS 2005:1 om ansökan om vissa jordbrukarstöd); allmänna råd in
+# the författningssamling print its designation or share a "föreskrifter och
+# allmänna råd" title.
 RE_BARE_OWN_REF = re.compile(
-    r"(?:föreskrifter(?:na)?|allmänna\s+råd(?:en)?)[^()]*\((\d{4}):(\d+)\)")
+    r"(?:föreskrifter(?:na)?(?:\s+och\s+allmänna\s+råd)?|kungörelsen?)[^()]*\((\d{4}):(\d+)\)")
 # the issuing agency, read from the masthead (searched over a whitespace-collapsed
 # copy, since two-column extraction breaks the lines apart). Three signals, tried
 # in order:
@@ -230,7 +352,10 @@ RE_DIREKTIV_CELEX = re.compile(r"/celex/\d+L\d")    # a directive (…L…), not
 # *it* amends, not ones this föreskrift implements).
 RE_JFR = re.compile(r"\bJfr\b(.*?)(?:\.\s|\n\n|\Z)", re.DOTALL)
 # the verb that closes a föreskrift preamble ("… föreskriver följande")
-RE_PREAMBLE_END = re.compile(r"föreskriver|kungör|beslutar|meddelar", re.I)
+RE_PREAMBLE_END = re.compile(r"föreskriver|\bkungör\b|beslutar|meddelar", re.I)   # kungör, not kungörelse
+# the masthead's closing clause when nothing else marks the body: "beslutat den
+# 31 augusti 2017." / "beslutade den 15 juni 2026."
+RE_BESLUTAD_LINE = re.compile(r"\s*besluta(?:de?|t)\s+den\s+\d", re.I)
 
 
 def _dedupe_bemyndigande(uris):
@@ -425,12 +550,17 @@ def _body_start(blocks):
     med-stöd-av lines). The first ``kapitel``/``paragraf`` marker is the reliable
     boundary; a föreskrift with no §§ at all (a short declarative, a förteckning)
     has none, so we fall back to the block just after the closing preamble verb
-    ('… föreskriver följande'), and failing even that keep everything."""
+    ('… föreskriver följande'); an allmänt råd with neither (KKVFS 2017:3, a
+    numbered list after "beslutat den 31 augusti 2017.") ends its masthead on
+    that decision date; failing even that keep everything."""
     for i, b in enumerate(blocks):
         if b.kind in ("kapitel", "paragraf"):
             return i
     for i, b in enumerate(blocks):
         if RE_PREAMBLE_END.search(b.text):
+            return i + 1
+    for i, b in enumerate(blocks):
+        if RE_BESLUTAD_LINE.match(b.text):
             return i + 1
     return 0
 
@@ -591,7 +721,7 @@ def role_declaration(masthead, harvest_title):
     return f"{masthead} {harvest_title or ''}"
 
 
-def extract_metadata(text, declaration, parser):
+def extract_metadata(text, declaration, parser, fs=None):
     """Best-effort masthead facts from the regulation's plain text. ``text`` is
     the whole document (ikraftträdande sits at the end, the rest up front);
     ``declaration`` is what the document says it *is*, per
@@ -618,13 +748,51 @@ def extract_metadata(text, declaration, parser):
         if dirs:
             genomfor.add(min(dirs, key=lambda r: r.start).uri)
     meta["genomfor"] = sorted(genomfor)
-    # upphäver: regulations an "ersätter/upphäver(s) …" clause replaces --
+    # upphäver: regulations an "ersätter/upphäver(s) …" PDF clause or an
+    # "upphävande av …" title replaces. The declaration includes the harvest title.
     # every clause, since the first "upphävs" in a document is often a bare
-    # provision repeal ("5 § upphävs") that names no regulation at all.
+    # provision repeal ("5 § upphävs") that names no regulation at all -- or a
+    # "beslutar att … ska upphöra att gälla" decision names. The decision's
+    # object stops at "om ändring i": repealing an ändringsförfattning
+    # ("(KVFS 2007:6) om ändring i … (KVFS 2006:26) ska upphöra att gälla",
+    # KVFS 2008:16) leaves the base regulation in force.
     # _fs_key, not lower(): 'ÅFS' must mint aafs/…, never a dangling åfs/…
-    meta["upphaver"] = sorted({regulation_uri(_fs_key(fs), y, str(int(n)))
-                               for m in RE_ERSATTER.finditer(text)
-                               for fs, y, n in RE_FS_REF.findall(m.group(1))})
+    # A förteckning över gällande föreskrifter (LIVSFS 2007:1) restates every
+    # regulation's "Upphäver …" entry; the document itself repeals nothing.
+    if RE_FORTECKNING.search(text[:1500]):
+        return meta
+    listed = RE_ENUMERATOR.sub(" − ", text)
+    targets = [_repeal_object(m.group(1)) for m in RE_ERSATTER.finditer(listed)]
+    targets += [_repeal_object(m.group(1), tail=True) for m in RE_UPPHORA.finditer(text)]
+    targets += [_repeal_object(m.group(1), tail=True) for m in RE_SKALL_UPPHORA.finditer(text)]
+    targets += [_repeal_object(m.group(1), tail=True) for m in RE_UPPHOR_BEFORE.finditer(text)]
+    targets += [_repeal_object(m.group(1), whole=True) for m in RE_UPPHOR_LIST.finditer(listed)]
+    targets += [_repeal_object(m.group(1), whole=True) for m in RE_UPPHAVS_LIST.finditer(listed)]
+    # the noun form in the declaration (masthead + harvest title), cut the same
+    # way: "upphävande av X (HSLF-FS 2019:43) om ändring i Y (HSLF-FS 2019:32)"
+    # repeals the amendment X, and Y stays in force
+    targets += [RE_ANDRING.split(m.group(1))[0] for m in RE_UPPHAVANDE.finditer(declaration)]
+    upphaver = {_ref_uri(_own_series_typo(f, fs), y, n)
+                for target in targets for f, y, n in RE_FS_REF.findall(target)}
+    if fs:
+        # a bare "(1993:21)" right after "föreskrifter" names the document's own
+        # series (RE_BARE_OWN_REF), as it does in an ändring title -- or its
+        # predecessor when the year predates the series (LIVSFS 2014:4 repeals
+        # "föreskrifter (1993:21)": SLVFS, since LIVSFS began in 2002)
+        upphaver |= {regulation_uri(_series_for_year(fs, int(y)), y, str(int(n)))
+                     for target in targets for y, n in RE_BARE_OWN_REF.findall(target)}
+    meta["upphaver"] = sorted(upphaver)
+    # andrar, from the amending enacting formula in the masthead ("föreskriver
+    # … i fråga om verkets föreskrifter och allmänna råd (SJVFS 2010:45) om …",
+    # SJVFS 2011:24, an omtryck whose title restates the base's); a title
+    # declaring "om ändring i …" wins over it in parse_record
+    formula = RE_AMENDING_FORMULA.search(declaration)
+    if formula and not RE_KONSOLIDERAD_MASTHEAD.search(declaration):
+        named = declaration[formula.end():formula.end() + 300]
+        meta["andrar"] = [_ref_uri(f, y, n) for f, y, n in RE_FS_REF.findall(named)[:1]]
+        if not meta["andrar"] and fs:
+            meta["andrar"] = [regulation_uri(_series_for_year(fs, int(y)), y, str(int(n)))
+                              for y, n in RE_BARE_OWN_REF.findall(named)[:1]]
     return meta
 
 
@@ -779,7 +947,13 @@ RE_MASTHEAD_BOILERPLATE = re.compile(
     # masthead's second column ("Box 7821, 103 97 Stockholm, Sverige, www.fi.se")
     r"|\bwww\.[\w.-]+|\bBox\s+\d+|\b\d{3}\s?\d{2}\s+[A-ZÅÄÖ][a-zåäö]+,?"
     r"|\bTfn\b[\s\d-]*|\bSverige\b,?"
-    r"|Publicerings?datum|Publicerade?\s+den|\b[A-ZÅÄÖ]{2,}-?FS\b|\b\d{4}:\d+\b"
+    r"|Publicerings?datum|Publicerade?\s+den|\b[A-ZÅÄÖ]{2,}(?:-| )?FS\b|\b\d{4}:\d+\b"
+    # the second column's ISO date ("Utkom från trycket 1998-01-26", the old
+    # Livsmedelsverket masthead), which lands mid-title like the "den …" form
+    r"|\b\d{4}-\d{2}-\d{2}\b"
+    # Jordbruksverket's register code ("Saknr K 72:1") and its "Omtryck" stamp,
+    # printed beside the title and landing mid-sentence like the dates
+    r"|\bSaknr\s+[A-ZÅÄÖ]\s*\d+(?::\d+)?|\bOmtryck\b"
     r"|\b(?:den\s+)?\d{1,2}\s+(?:%s)(?:\s+\d{4})?|\bnr\s+\d+"
     % "|".join(MONTHS), re.IGNORECASE)
 # a word the removal left doubled ("Kriminalvårdens
@@ -830,9 +1004,27 @@ TITLE_MAX = 300      # a subject longer than this is extraction running on
 _NAME_JOINERS = {"för", "och", "av", "i", "med", "samt", "vid", "om"}
 
 
+# the 1996-2001 Livsmedelsverket scans carry an OCR layer that splits the
+# designation at random: 240 "SLV FS", 96 "SL V FS", 73 "SL VFS", 16 "S LV FS"
+# across the 244 documents -- one spelling before any pattern reads it
+# Livsmedelsverket prints its register code beside the title -- "(H 34)",
+# "(H 32:9)", "(J 77)" -- and two-column extraction drops it into the title
+# sentence or inside a reference's parenthesis ("(SLV FS (H 34) 1993:34)")
+RE_SLV_REGISTER_CODE = re.compile(r"\(\s*[HJ]\s?[0-9Il][0-9Il ]*(?:\s*:\s*[0-9Il ]+)?\s*\)")
+RE_OCR_SLVFS = re.compile(r"\bS\s?L\s?[VY]\s?F\s?S\b")
+# … and its numbers: "SLVFS I 995 :3 I" for SLVFS 1995:31 (60 of 1,187 on the
+# first two pages), and "ändring" as "Undring"/"lindring" before "i kungörelsen"
+RE_OCR_SLVFS_NUMBER = re.compile(r"SLVFS\s*([0-9Il](?: ?[0-9Il]){2,4})\s*:\s*([0-9Il](?: ?[0-9Il]){0,2})(?=\D|$)")
+RE_OCR_ANDRING = re.compile(r"(?<![\wåäö])(?:lindring|~indring|[UÄÅA]ndring)(?=\s+(?:i|av)\b)")
+# the two columns interleaved mid-phrase: "föreskrifter i om ändring verkets
+# föreskrifter (SLVFS 1999:6)" for "föreskrifter om ändring i verkets …"
+RE_OCR_I_OM_ANDRING = re.compile(r"\bi\s+om\s+(?:ändring|lindring|~indring|[UÄÅA]ndring)\b")
+
+
 def _strip_boilerplate(masthead):
     """The masthead with its standing text deleted and the sentence rejoined,
     parenthesised references left intact."""
+    masthead = RE_SLV_REGISTER_CODE.sub(" ", masthead)
     # a held parenthesis keeps its FS number but not the column header the
     # second column dropped into it ("(LVFS Utkom från trycket 2006:16)")
     held = [" ".join(RE_MASTHEAD_COLUMN.sub(" ", p).split())
@@ -864,7 +1056,7 @@ def _agency_possessive(before):
     start = len(tokens) - 1
     while start > 0:
         prev, cur = tokens[start - 1].group(), tokens[start].group()
-        if not prev[:1].isalpha() or prev.endswith((":", ".")):
+        if not prev[:1].isalpha() or prev.endswith((":", ".", ",")):
             break                       # standing masthead text, not a name
         if prev.lower() in _NAME_JOINERS or prev[:1].islower():
             start -= 1
@@ -876,6 +1068,12 @@ def _agency_possessive(before):
             break
         start -= 1
         break
+    # a name begins with a capitalised word; a walk that ran back over lower-
+    # case words to a boundary without reaching one took the utgivare's role
+    # for the name ("Johan Sahl, tillförordnad chefsjurist Konkurrensverkets"
+    # in KKVFS 2025:1) -- only the possessive itself is the agency then
+    if not tokens[start].group()[:1].isupper():
+        return tokens[-1].start()
     return tokens[start].start()
 
 
@@ -916,7 +1114,11 @@ def title_from_masthead(blocks, start):
     repeat it. The blocks are joined, and the standing masthead text deleted,
     before matching: two-column extraction interleaves the columns, so neither
     block holds the whole sentence and the second column lands inside it."""
-    masthead = _strip_boilerplate(" ".join(_full_text(blocks[:start]).split()))
+    # repaired twice: once joined, and once more after the column headers are
+    # gone, since one can land between a designation and its number
+    # ("(SLVFS Utkom från trycket 1994: 13)", SLVFS 1998:41)
+    masthead = _repair_ocr_text(_strip_boilerplate(
+        _repair_ocr_text(" ".join(_full_text(blocks[:start]).split()))))
     for word in RE_TITLE_TYPE.finditer(masthead):
         head = _agency_possessive(masthead[:word.start()].rstrip())
         rest = masthead[word.end():word.end() + TITLE_MAX]
@@ -930,21 +1132,60 @@ def title_from_masthead(blocks, start):
     return None
 
 
-def parse_pdf(path, identifier, parser, patch_key=None, harvest_title=None):
+def _pages(path, patch_key=None):
+    """The PDF's pages of text, from its visible text layer -- or, when that
+    layer is empty, from the hidden one: a scanned föreskrift (SLVFS 1996-2000,
+    188 documents) carries its text only as an invisible OCR layer behind the
+    page image, which pdftohtml drops unless asked for hidden text. A scan with
+    no text layer at all (LIVSFS 2002:49, six documents) is OCRed first."""
+    pages = list(pdf_pages(path, patch_key))
+    if any(lines for _pageno, lines in pages):
+        return pages
+    pages = list(pdf_pages(path, patch_key, hidden=True))
+    if any(lines for _pageno, lines in pages):
+        return pages
+    return list(pdf_pages(ocr_pdf(path, "swe"), patch_key, hidden=True))
+
+
+def _repair_ocr_text(text):
+    """`text` with the OCR layer's damage to designations undone: the register
+    code first, since it lands between the designation and the number ("(SLV
+    FS (H 33:1) 1993: 17)", SLVFS 1997:2), then the split designation, its
+    digits, "ändring" and the two-column reorder "i om ändring"."""
+    text = RE_SLV_REGISTER_CODE.sub(" ", text)
+    text = RE_OCR_SLVFS.sub("SLVFS", text)
+    text = RE_OCR_SLVFS_NUMBER.sub(
+        lambda m: "SLVFS %s:%s" % tuple(g.replace("I", "1").replace("l", "1").replace(" ", "")
+                                       for g in m.groups()), text)
+    text = RE_OCR_ANDRING.sub("ändring", text)
+    return RE_OCR_I_OM_ANDRING.sub("om ändring i", text)
+
+
+def _repair_ocr(blocks):
+    """The blocks repaired one by one -- and again once joined, where the
+    masthead's second column split a reference over two blocks ("(SLVFS " |
+    "1994: 13) med föreskrifter", SLVFS 1997:11)."""
+    for b in blocks:
+        b.text = _repair_ocr_text(b.text)
+    return blocks
+
+
+def parse_pdf(path, identifier, parser, patch_key=None, harvest_title=None, fs=None):
     """One föreskrift PDF -> (structure tree, its metadata dict, its footnotes).
     Metadata is read
     from the whole text (the masthead up front, ikraftträdande at the end); the
     structure is built from the operative body only, the masthead dropped.
     `patch_key=(source, basefile)` patches the pdftohtml XML before extraction."""
-    blocks, notes = parse_body(pdf_pages(path, patch_key), identifier)
+    blocks, notes = parse_body(_pages(path, patch_key), identifier)
+    _repair_ocr(blocks)
     start = _body_start(blocks)
-    masthead = _full_text(blocks[:start])
+    masthead = _repair_ocr_text(_full_text(blocks[:start]))
     # the notes are read for metadata with the body: the "Jfr … direktiv" clause
     # that names what a föreskrift genomför is *printed as* a page-foot note, so
     # a scan of the blocks alone would lose the very relation it exists to find
-    meta = extract_metadata("\n".join([_full_text(blocks)]
-                                      + [text for _mark, text in notes]),
-                            role_declaration(masthead, harvest_title), parser)
+    meta = extract_metadata(_repair_ocr_text("\n".join([_full_text(blocks)]
+                                                       + [text for _mark, text in notes])),
+                            role_declaration(masthead, harvest_title), parser, fs=fs)
     # the publisher is a masthead fact only (a body citation to another agency's
     # föreskrifter must not be mistaken for it), so read it from the masthead blocks
     meta["publisher"] = extract_publisher(masthead or _full_text(blocks))
@@ -986,11 +1227,60 @@ def masthead_amendments(masthead, fs, base_ars, base_lop):
     pages list amendments incompletely, the consolidation masthead names
     exactly the ones folded in."""
     base = (base_ars, str(int(base_lop)))
+    family = _series_family(_fs_key(fs))
     seen = {}
     for f, y, n in RE_FS_REF.findall(masthead):
-        if _fs_key(f) == _fs_key(fs) and (y, str(int(n))) != base:
+        if _fs_key(f) in family and (y, str(int(n))) != base:
             seen.setdefault((int(y), int(n)), f)
     return [(f, str(y), str(n)) for (y, n), f in sorted(seen.items())]
+
+
+_FS_SERIES = datasets.load_fs_series()
+
+
+def _ref_uri(designation, year, lopnummer):
+    """A cited regulation's uri: the designation's slug, or its predecessor
+    when the year predates the series ("LIVSFS 2000:22" in LIVSFS 2014:9 is
+    SLVFS 2000:22, LIVSFS having begun in 2002)."""
+    return regulation_uri(_series_for_year(_fs_key(designation), int(year)),
+                          year, str(int(lopnummer)))
+
+
+def _own_series_typo(designation, fs):
+    """A designation that is no series but spells the document's own with its
+    letters shuffled ("SVJFS 2008:33" in SJVFS 2025:7) is the document's own."""
+    key = _fs_key(designation)
+    if fs and key not in _FS_SERIES and sorted(key) == sorted(fs):
+        return _FS_SERIES[fs]["designation"]
+    return designation
+
+
+def _series_for_year(fs, year):
+    """The series a bare reference from a document of `fs` names for `year`:
+    `fs` itself, or the predecessor that was current then (series.json
+    `from`, the successor's first year). A series with several predecessors
+    (SJVFS took over both LSFS, to 1990, and DFS, 2004–2007) takes the one
+    whose last year comes first at or after `year`; a year before every
+    predecessor stays where the document put it."""
+    while year < _FS_SERIES.get(fs, {}).get("from", 0):
+        earlier = [p for p, row in _FS_SERIES.items()
+                   if row.get("successor") == fs and row.get("until", year) >= year]
+        if not earlier:
+            return fs
+        fs = min(earlier, key=lambda p: _FS_SERIES[p].get("until", year))
+    return fs
+
+
+def _series_family(fs):
+    """A samling and the series that succeeded it (series.json `successor`):
+    an SLVFS base is amended and consolidated by LIVSFS ("ändringar t.o.m.
+    LIVSFS 2016:9" in SLVFS 1997:27's konsoliderad version), an RSFS base by
+    SKVFS. A reference to the successor is an amendment of the base, not
+    another series' document."""
+    family = [fs]
+    while _FS_SERIES.get(family[-1], {}).get("successor"):
+        family.append(_FS_SERIES[family[-1]]["successor"])
+    return set(family)
 
 
 def konsoliderad_tom(masthead, fs, base_ars, base_lop):
@@ -1001,8 +1291,8 @@ def konsoliderad_tom(masthead, fs, base_ars, base_lop):
     refs = masthead_amendments(masthead, fs, base_ars, base_lop)
     if not refs:
         return None
-    _, y, n = refs[-1]
-    return regulation_uri(fs, y, n)
+    f, y, n = refs[-1]
+    return regulation_uri(_fs_key(f), y, n)      # the amendment's own series
 
 
 def parse_consolidation(path, identifier, fs, base_ars, base_lop, parser):
@@ -1014,7 +1304,8 @@ def parse_consolidation(path, identifier, fs, base_ars, base_lop, parser):
     lines out of the body, so discarding them here would put that text in no
     artifact key at all. No konsoliderad PDF in the corpus prints one today
     (0 of 150 sampled), which is why the discard went unnoticed."""
-    blocks, notes = parse_body(pdf_pages(path), identifier)
+    blocks, notes = parse_body(_pages(path), identifier)
+    _repair_ocr(blocks)
     start = _body_start(blocks)
     masthead = _full_text(blocks[:start]) or _full_text(blocks)
     return (_structure(blocks[start:], parser), footnote_nodes(notes, parser),
@@ -1185,14 +1476,22 @@ def andrar_target(title, fs, self_uri):
     designation, when the title restates it, is never the target."""
     m = RE_ANDRING.search(title or "")
     if not m:
+        # an omtryck restates the base's title, its designation in the place
+        # the document's own would stand ("Statens jordbruksverks föreskrifter
+        # (SJVFS 1995:71) om utförsel …" as SJVFS 2000:84); a name that is not
+        # the document's own is the base it reprints
+        for f, y, n in RE_TITLE_DESIGNATION.findall(title or ""):
+            uri = _ref_uri(f, y, n)
+            if uri != self_uri and not RE_UPPHAVANDE.search(title or ""):
+                return uri
         return None
     rest = title[m.end():]
     for f, y, n in RE_FS_REF.findall(rest):
-        uri = regulation_uri(_fs_key(f), y, str(int(n)))
+        uri = _ref_uri(f, y, n)
         if uri != self_uri:
             return uri
     for y, n in RE_BARE_OWN_REF.findall(rest):
-        uri = regulation_uri(fs, y, str(int(n)))
+        uri = regulation_uri(_series_for_year(fs, int(y)), y, str(int(n)))
         if uri != self_uri:
             return uri
     return None
@@ -1206,7 +1505,7 @@ def amendment_uri(identifier):
     m = RE_FS_REF.search(identifier or "")
     if not m:
         return None
-    return regulation_uri(_fs_key(m.group(1)), m.group(2), str(int(m.group(3))))
+    return _ref_uri(m.group(1), m.group(2), m.group(3))
 
 
 def body_path(root, fs, entry):
@@ -1242,7 +1541,7 @@ def parse_record(record, root):
     if reg_file:
         structure, meta, notes = parse_pdf(
             body_path(root, fs, reg_file), record["identifier"], parser,
-            ("foreskrift", basefile), record.get("title"))
+            ("foreskrift", basefile), record.get("title"), fs=fs)
 
     # the PDF masthead is the authoritative issuer; the harvest label (the current
     # custodian agency) is only the fallback when the PDF names none
@@ -1258,13 +1557,17 @@ def parse_record(record, root):
         title=title, publisher=publisher,
         source_url=record.get("url"),
         structure=structure, footnotes=notes, **meta)
-    # the resolved title, not the raw harvest one: for a chrome-titled record
-    # the ändring declaration lives in the body rubric just adopted above
-    if target := andrar_target(title or "", fs, reg.uri):
+    # the resolved title first, then the body rubric: Jordbruksverket's register
+    # titles an amendment with its base's title ("Statens jordbruksverks
+    # föreskrifter om arealbidrag" for SJVFS 1994:26), and only the printed
+    # masthead says "Föreskrifter om ändring i … (SJVFS 1993:46)"
+    if target := (andrar_target(title or "", fs, reg.uri)
+                  or andrar_target(body_title or "", fs, reg.uri)):
         reg.andrar = [target]
     # an "ersätter/upphäver …" clause restating the document's own designation
     # must not claim the regulation replaces itself (LIVSFS 2022:4 does this)
     reg.upphaver = [u for u in reg.upphaver if u != reg.uri]
+    reg.andrar = [u for u in reg.andrar if u != reg.uri]
 
     for am in files.get("amendment", []):
         # the harvest record always carries both keys (harvest.py normalizes);

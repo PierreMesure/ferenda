@@ -566,3 +566,144 @@ def test_a_judgment_has_no_inferred_articles():
     doc = parse_html(html, "61989TJ0068", "swe")
     assert "article" not in kinds(doc)
     assert kinds(doc) == ["paragraph"] * 4
+
+
+# ---- the consolidated treaties (12016M/TXT, 12016E/TXT) --------------------
+#
+# Every case below is a shape 12016M/TXT (FEU) prints. The OJ HTML gives its
+# 121-line printed contents, its divisions and its 37 protocols the same three
+# classes, and the parser read all three flat.
+
+def headings(doc):
+    return [(b.level, b.label, b.text) for b in doc.body if b.kind == "heading"]
+
+
+def test_a_division_and_its_title_are_one_heading():
+    # "AVDELNING I" (ti-section-1) and "GEMENSAMMA BESTÄMMELSER" (ti-section-2)
+    # are one heading printed on two lines, the way Formex sets TI and STI
+    html = """<body>
+      <p class="ti-section-1">AVDELNING I</p>
+      <p class="ti-section-2">GEMENSAMMA BESTÄMMELSER</p>
+      <p class="ti-art">Artikel 1</p>
+    </body>"""
+    doc = parse_html(html, "12016M/TXT", "swe")
+    assert headings(doc) == [(1, "AVDELNING I", "GEMENSAMMA BESTÄMMELSER")]
+
+
+def test_a_division_that_carries_its_own_title_is_not_merged():
+    # only a bare designation takes the next line as its title
+    html = """<body>
+      <p class="ti-section-1">KAPITEL II Skyddsåtgärder</p>
+      <p class="ti-section-2">Avsnitt 1</p>
+    </body>"""
+    doc = parse_html(html, "31991L0496", "swe")
+    assert headings(doc) == [(1, None, "KAPITEL II Skyddsåtgärder"),
+                             (2, None, "Avsnitt 1")]
+
+
+def test_divisions_nest_by_their_designator():
+    # the OJ marks every division `ti-section-1` whatever its depth, so the word
+    # is what says a Kapitel sits inside an Avdelning and an Avsnitt inside the
+    # Kapitel. Read flat, the four listed as siblings.
+    html = """<body>
+      <p class="ti-section-1">FÖRSTA DELEN</p><p class="ti-section-2">PRINCIPERNA</p>
+      <p class="ti-section-1">AVDELNING V</p><p class="ti-section-2">YTTRE ÅTGÄRDER</p>
+      <p class="ti-section-1">KAPITEL 2</p><p class="ti-section-2">SÄRSKILDA BESTÄMMELSER</p>
+      <p class="ti-section-1">AVSNITT 1</p><p class="ti-section-2">GEMENSAMMA BESTÄMMELSER</p>
+      <p class="ti-section-1">AVDELNING VI</p><p class="ti-section-2">SLUTBESTÄMMELSER</p>
+    </body>"""
+    doc = parse_html(html, "12016E/TXT", "swe")
+    assert [(lvl, label) for lvl, label, _t in headings(doc)] == [
+        (1, "FÖRSTA DELEN"),      # a treaty designates its parts in the
+        (2, "AVDELNING V"),       # definite form, ordinal in front
+        (3, "KAPITEL 2"),
+        (4, "AVSNITT 1"),
+        (2, "AVDELNING VI")]      # closes the Kapitel and the Avsnitt in it
+
+
+def test_a_protocol_is_a_section_of_its_own():
+    # a title-classed line inside the body names a document section: skipped as
+    # bibliographic title material, FEU's 37 protocols and 65 declarations
+    # reached the artifact as headless runs of articles
+    html = """<body>
+      <p class="ti-art">Artikel 55</p>
+      <p class="doc-ti">PROTOKOLL</p>
+      <p class="doc-ti">PROTOKOLL (nr 1)</p>
+      <p class="doc-ti">OM DE NATIONELLA PARLAMENTENS ROLL I EUROPEISKA UNIONEN</p>
+      <p class="ti-section-1">AVDELNING I</p>
+      <p class="ti-section-2">INFORMATION TILL DE NATIONELLA PARLAMENTEN</p>
+      <p class="ti-art">Artikel 1</p>
+      <p class="doc-ti">PROTOKOLL (nr 2)</p>
+      <p class="doc-ti">OM TILLÄMPNING AV SUBSIDIARITETSPRINCIPEN</p>
+    </body>"""
+    doc = parse_html(html, "12016M/TXT", "swe")
+    assert headings(doc) == [
+        (1, None, "PROTOKOLL"),                       # the section over them
+        (2, "PROTOKOLL (nr 1)",
+         "OM DE NATIONELLA PARLAMENTENS ROLL I EUROPEISKA UNIONEN"),
+        (3, "AVDELNING I", "INFORMATION TILL DE NATIONELLA PARLAMENTEN"),
+        (2, "PROTOKOLL (nr 2)", "OM TILLÄMPNING AV SUBSIDIARITETSPRINCIPEN")]
+
+
+def test_a_section_title_printed_on_three_lines_is_one_heading():
+    # the declarations name themselves over three title-classed lines
+    html = """<body>
+      <p class="ti-art">Artikel 1</p>
+      <p class="doc-ti">FÖRKLARINGAR</p>
+      <p class="doc-ti">SOM FOGAS TILL SLUTAKTEN</p>
+      <p class="doc-ti">undertecknat den 13 december 2007</p>
+      <p class="ti-grseq-1">1. Förklaring om stadgan</p>
+    </body>"""
+    doc = parse_html(html, "12016M/TXT", "swe")
+    assert headings(doc) == [
+        (1, "FÖRKLARINGAR",
+         "SOM FOGAS TILL SLUTAKTEN undertecknat den 13 december 2007"),
+        (2, None, "1. Förklaring om stadgan")]   # each declaration under it
+
+
+def test_an_annex_sits_beside_the_divisions_it_follows():
+    # protocol 3's Bilaga I is the Court's own annex, not a division of it
+    html = """<body>
+      <p class="ti-art">Artikel 1</p>
+      <p class="doc-ti">PROTOKOLL (nr 3)</p>
+      <p class="doc-ti">OM STADGAN FÖR EUROPEISKA UNIONENS DOMSTOL</p>
+      <p class="ti-section-1">AVDELNING V</p>
+      <p class="ti-section-2">SLUTBESTÄMMELSER</p>
+      <p class="doc-ti">BILAGA I</p>
+      <p class="ti-grseq-1">EUROPEISKA UNIONENS PERSONALDOMSTOL</p>
+    </body>"""
+    doc = parse_html(html, "12016M/TXT", "swe")
+    assert [(lvl, label or text) for lvl, label, text in headings(doc)] == [
+        (1, "PROTOKOLL (nr 3)"),
+        (2, "AVDELNING V"),
+        (2, "BILAGA I"),                  # beside the Avdelning, not under it
+        (3, "EUROPEISKA UNIONENS PERSONALDOMSTOL")]
+
+
+def test_the_documents_own_printed_contents_is_dropped():
+    # FEU prints its contents as 121 one-row tables of heading + page number.
+    # They parsed as 121 `tabell` blocks at the top of the body -- navigation
+    # the page rebuilds from the structure, and page numbers a web page has no
+    # use for. The run ends at the first element that is not a table.
+    html = """<body>
+      <p class="doc-ti">FÖRDRAGET OM EUROPEISKA UNIONEN</p>
+      <p class="ti-tbl">Innehållsförteckning</p>
+      <table><tr><td>AVDELNING I</td><td>GEMENSAMMA BESTÄMMELSER</td><td>16</td></tr></table>
+      <table><tr><td>AVDELNING II</td><td>DEMOKRATISKA PRINCIPER</td><td>20</td></tr></table>
+      <p class="normal">INGRESS</p>
+      <p class="ti-section-1">AVDELNING I</p>
+      <p class="ti-section-2">GEMENSAMMA BESTÄMMELSER</p>
+    </body>"""
+    doc = parse_html(html, "12016M/TXT", "swe")
+    assert kinds(doc) == ["preamble", "heading"]
+    assert headings(doc) == [(1, "AVDELNING I", "GEMENSAMMA BESTÄMMELSER")]
+
+
+def test_a_table_that_is_not_the_printed_contents_survives():
+    html = """<body>
+      <p class="ti-art">Artikel 1</p>
+      <p class="ti-tbl">Tabell 1</p>
+      <table><tr><td>Apples</td><td>3</td></tr></table>
+    </body>"""
+    doc = parse_html(html, "32016R0679", "swe")
+    assert kinds(doc) == ["article", "heading", "tabell"]
