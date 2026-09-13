@@ -3,13 +3,14 @@ lagrummet.se list (the per-county samlingar excluded) as configuration over the
 shared harvest engine (:mod:`harvest`). Each entry is an
 :class:`~harvest.Agency`: a författningssamling code, the issuing org, its index
 URL, and the architecture (an ``enumerate`` + a ``resolve``) that fits its site,
-plus ``params``. 80 harvest *scopes* are registered over 75
-författningssamlingar: 74 samlingar one agency owns outright (``Agency.scope``
-is None, so the fs code is the scope name) -- 67 live-harvested and 7 closed
-series with no live harvester (RSFS, SOSFS, SLVFS, LSFS, LBS, DFS, SVKFS), whose
-documents live in the corpus -- plus the six sites that all publish into HSLF-FS, which is one
-samling with seven issuing agencies (:mod:`hslffs`). SKVFS and MTFS select a
-Camoufox transport in config; ordinary agencies stay on HTTP.
+plus ``params``. 82 harvest *scopes* are registered over 77
+författningssamlingar: 76 samlingar one agency owns outright (``Agency.scope``
+is None, so the fs code is the scope name) -- 68 live-harvested and 8 closed
+series with no live harvester (RSFS, SOSFS, SLVFS, LSFS, LBS, DFS, SVKFS,
+ESVFA), whose documents live in the corpus -- ESVFA excepted, whose current text
+arrives through the STKFA scope -- plus the six sites that all publish into
+HSLF-FS, which is one samling with seven issuing agencies (:mod:`hslffs`). SKVFS
+and MTFS select a Camoufox transport in config; ordinary agencies stay on HTTP.
 
 An agency is *config*, not a pipeline. Many sites are covered by the three
 generic enumerate shapes (``indexed``/``paginated``/``json``) plus a
@@ -55,7 +56,7 @@ from ..lib.harvest import write_record
 from ..lib.net import BROWSER_UA, is_not_found, request
 from ..lib.util import basefile_slug as slug
 from ..lib.util import document_extension, record_path
-from . import harvest, hslffs, mtfs, skvfs
+from . import harvest, hslffs, mtfs, skvfs, statskontoret
 from .harvest import (
     Agency,
     DocRef,
@@ -2495,6 +2496,28 @@ SOSFS = frozen_agency("sosfs", "Socialstyrelsen", "Socialstyrelsen", "SOSFS",
 
 
 # --------------------------------------------------------------------------
+# STKFA + ESVFA (Statskontoret) -- the one samling pair published as a website
+# rather than as PDFs. Statskontoret took over ESV's rulemaking, and both series
+# live on in the current EA-regelverket: one walk of that tree lists both, and
+# `DocRef.fs` files each document under its own samling (:mod:`statskontoret`).
+# --------------------------------------------------------------------------
+
+STKFA = Agency(
+    fs="stkfa", name="Statskontoret", publisher="Statskontoret",
+    designation="STKFA",
+    base_url="https://forum.statskontoret.se",
+    index_url="https://forum.statskontoret.se/ea-regelverket/",
+    enumerate=statskontoret.enumerate_regulations, resolve=statskontoret.resolve,
+)
+# ESVFA issues nothing new, so it has no harvester of its own -- but unlike the
+# other closed series its documents are not only in the corpus: they are the
+# EA-regelverket's current text and arrive through the STKFA scope above. The row
+# is what gives them their own designation and issuing agency.
+ESVFA = frozen_agency("esvfa", "Ekonomistyrningsverket", "Ekonomistyrningsverket",
+                      "ESVFA", "https://www.esv.se")
+
+
+# --------------------------------------------------------------------------
 # HSLF-FS -- the one samling with several publishers. Seven agencies issue into
 # Gemensamma författningssamlingen avseende hälso- och sjukvård, socialtjänst,
 # läkemedel, folkhälsa m.m., each publishing on its own site, so the samling is
@@ -2644,7 +2667,7 @@ HSLFFS_LV = Agency(
 
 # scope name -> Agency: the CLI's `lagen foreskrift download <scope>` names,
 # and the keys `download.sync` fans out over. The scope is the fs code for the
-# 65 samlingar one agency owns outright, and `hslffs-<publisher>` for the six
+# 76 samlingar one agency owns outright, and `hslffs-<publisher>` for the six
 # sites that all publish into HSLF-FS. New agencies append here; a new *site
 # shape* is a new enumerate/classify in harvest.py, not a new pipeline.
 REGISTRY = {a.scope or a.fs: a for a in (
@@ -2669,6 +2692,7 @@ REGISTRY = {a.scope or a.fs: a for a in (
     MTFS, SKVFS,                                       # live: Camoufox for the F5 wall
     RSFS, SOSFS, SLVFS,                                # closed series; RSFS also emitted by SKVFS, SLVFS by LIVSFS
     LSFS, LBS, DFS,                                    # closed series the SJVFS register keeps
+    STKFA, ESVFA,                                      # one website, two samlingar
     HSLFFS_SOS, HSLFFS_FOHM, HSLFFS_IVO,               # one samling, six publishing
     HSLFFS_MFOF, HSLFFS_TLV, HSLFFS_LV,                #   sites (fs="hslffs")
 )}

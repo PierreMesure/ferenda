@@ -650,6 +650,33 @@ def harvest(agency, root, full=False, only=None, limit=None, delay=0.5, log=prin
 INCREMENTAL_BUDGET = 300.0
 
 
+def item_key(agency, root, ref):
+    """What :func:`lib.harvest.walk` needs to place one enumerated ref: its
+    basefile, whether the store already holds it, and its date."""
+    # basefile is always "<fs>/<year>:<lopnummer>" (built by `ref`, off a regex
+    # that only ever captures a 4-digit year) -- the year anchors the date
+    # watermark; a shape that violates this is this module's own bug, not a data
+    # quirk to route around
+    year = ref.basefile.split("/", 1)[1].split(":")[0]
+    if not (len(year) == 4 and year.isdigit()):
+        raise UpstreamChanged("%s: basefile year %r is not a 4-digit year"
+                              % (ref.basefile, year))
+    # the record lives under the document's own fs, which is agency.fs unless the
+    # row named a different samling (see DocRef.fs)
+    stored = record_path(root, ref.fs or agency.fs, ref.basefile)
+    downloaded = compress.exists(stored)
+    if downloaded and ref.extra.get("updated_at"):
+        # a listing that states when the document last changed: "on disk" is then
+        # "on disk *and current*", which is what `ItemKey.is_downloaded` means
+        # (`lib.harvest`). Statskontoret publishes its regulations as a website,
+        # so a consolidation moves on without taking a new number, and the page's
+        # own `last-modified` is the only thing that says it did.
+        downloaded = (compress.read_json(stored).get("updated_at")
+                      == ref.extra["updated_at"])
+    return ItemKey(basefile=ref.basefile, is_downloaded=downloaded,
+                   date=f"{year}-12-31")
+
+
 def _harvest_session(agency, root, session, full, only, limit, delay, log,
                      reporter=None):
     """Run the shared walk over an already-selected HTTP or browser transport."""
@@ -680,28 +707,13 @@ def _harvest_session(agency, root, session, full, only, limit, delay, log,
     if only is None and not full and watermark.last_harvest is not None:
         set_deadline(session, time.monotonic() + INCREMENTAL_BUDGET)
 
-    def item_key(ref):
-        # basefile is always "<fs>/<year>:<lopnummer>" (built by ref, above, off
-        # a regex that only ever captures a 4-digit year) -- the year anchors the
-        # date watermark; a shape that violates this is this module's own bug,
-        # not a data quirk to route around
-        year = ref.basefile.split("/", 1)[1].split(":")[0]
-        if not (len(year) == 4 and year.isdigit()):
-            raise UpstreamChanged("%s: basefile year %r is not a 4-digit year"
-                                  % (ref.basefile, year))
-        return ItemKey(
-            basefile=ref.basefile,
-            # the record lives under the document's own fs, which is agency.fs
-            # unless the row named a different samling (see DocRef.fs)
-            is_downloaded=compress.exists(record_path(root, ref.fs or agency.fs, ref.basefile)),
-            date=f"{year}-12-31")
-
     def resolve(ref):
         return agency.resolve(session, agency, ref, root, delay,
                               log=log, rejects=rejects)
 
     result = walk(agency.enumerate(session, agency), resolve=resolve,
-                  item_key=item_key, watermark=watermark, full=full, only=only,
+                  item_key=lambda ref: item_key(agency, root, ref),
+                  watermark=watermark, full=full, only=only,
                   limit=limit, budget=INCREMENTAL_BUDGET, scope=scope,
                   log=log, reporter=reporter)
 

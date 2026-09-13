@@ -29,7 +29,7 @@ Two layers over the shared font-aware extraction (``lib.pdftext``):
 import re
 from pathlib import Path
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 
 from ..lib import begrepp, compress, datasets, tabell
 from ..lib.artifact import footnote_nodes
@@ -278,8 +278,10 @@ RE_FORTECKNING = re.compile(r"\bf[öo]\s?rteckning(?:en|ar)?\s+över\s+(?:gälla
 RE_UPPHAVANDE = re.compile(r"\bupphävande\s+av\b(?!\s+vissa\s+(?:regler|bestämmelser|delar)\b|\s+\d+\s*§)(.*?)(?:\.|$)",
                            re.DOTALL | re.I)
 # NFS/TFS … ELSÄK-FS; the pre-2002 Livsmedelsverket masthead prints "SLV FS
-# 1996:1" with a space, which `_fs_key` folds away like the hyphen
-RE_FS_REF = re.compile(r"\b([A-ZÅÄÖ]+(?:-| )?FS)\s*(\d{4}):(\d+)")
+# 1996:1" with a space, which `_fs_key` folds away like the hyphen. "…FA" is
+# ESVFA/STKFA, published as föreskrifter och allmänna råd rather than as a
+# författningssamling
+RE_FS_REF = re.compile(r"\b([A-ZÅÄÖ]+(?:-| )?(?:FS|FA))\s*(\d{4}):(\d+)")
 # an ändringsförfattning's own title names its target: "… föreskrifter om
 # ändring i <agency>s föreskrifter (ÅFS 2005:5) om …". Some agencies drop
 # their own series designation in the parenthesis ("föreskrifter (2007:12)");
@@ -1333,25 +1335,167 @@ RE_HTML_PREAMBLE = re.compile(
 # register of the family rather than text of the act
 RE_HTML_END = re.compile(r"Tryckta versioner")
 
+# the EA-regelverket page's two typed sections: binding föreskrifter, and the
+# allmänna råd printed under the provision they explain (:mod:`statskontoret`)
+EA_SECTIONS = "div.foreskrifter, div.allmanna-rad"
+# the block-level elements those sections set their text in. A `div` is a layout
+# wrapper around more of the same (`div.inner-content-table` holds the page's
+# tables), so it is walked rather than read; anything else is a shape this
+# parser has not seen and must not drop silently (rule:fail-fast)
+EA_BLOCKS = ("h2", "h3", "h4", "p", "ol", "ul", "table", "div")
+# run into the flowing text: a designation in a `strong`, a link, a line break
+EA_INLINE = ("strong", "span", "em", "a", "b", "i", "br", "sup", "sub")
+# the heading over the section listing what each amendment changed, which is
+# amendment evidence and not text of the regulation
+RE_EA_OVERGANG = re.compile(r"^Övergångsbestämmelser")
 
-def parse_consolidation_html(path, parser):
+
+def _ea_table(table):
+    """One HTML table -> its ``tabell`` block. Read as a table rather than as
+    prose: `get_text` on it runs every cell of "Tabell 1 Översikt över
+    verksamhetens finansiering" into one line."""
+    rows = [tuple(" ".join(cell.get_text(" ", strip=True).split())
+                  for cell in row.find_all(["th", "td"]))
+            for row in table.find_all("tr")]
+    return Block("tabell", "", None, rows=[row for row in rows if any(row)],
+                 th=table.find("tr").find("th") is not None)
+
+
+def _ea_blocks(container, blocks):
+    """Append `container`'s content to `blocks` in the order it is printed.
+
+    Prose accumulates as :class:`Para` runs and goes through `classify`, which is
+    what reads the printed "1 §"/"1 kap." markers; a table interrupts that run
+    and becomes its own block, so it keeps its place between the paragraphs it
+    was set between. Heading sizes are ranked by tag, so `_rank_rubriker` can
+    tell a kapitel heading from a rubrik under it.
+
+    Loose text and inline tags between two blocks are one paragraph: the page
+    sets whole provisions as bare text children of the section ("Bestämmelser om
+    redovisning mot anslag finns i anslagsförordningen (2011:223). (ESVFA
+    2024:1).")."""
+    paras, loose = [], []
+
+    def flush_loose():
+        if loose:
+            paras.append(Para(" ".join(loose)))
+            loose.clear()
+
+    def flush():
+        flush_loose()
+        if paras:
+            blocks.extend(classify(paras, None))
+            paras.clear()
+
+    for el in container.children:
+        if isinstance(el, NavigableString):
+            if (text := " ".join(el.split())):
+                loose.append(text)
+            continue
+        if el.name in EA_INLINE:
+            if (text := " ".join(el.get_text(" ", strip=True).split())):
+                loose.append(text)
+            continue
+        assert el.name in EA_BLOCKS, (
+            "unknown EA-regelverket element <%s class=%r>: %.60s"
+            % (el.name, el.get("class"), el.get_text(" ", strip=True)))
+        flush_loose()
+        if el.name == "div":                   # a layout wrapper, not a block
+            flush()
+            _ea_blocks(el, blocks)
+            continue
+        if el.name == "table":
+            flush()
+            blocks.append(_ea_table(el))
+            continue
+        if not (text := " ".join(el.get_text(" ", strip=True).split())):
+            continue
+        if el.name in ("ol", "ul"):
+            # the numbered points a § is set in. The printed marker is the
+            # list's, not the item's text, so each item is its own paragraph and
+            # `RE_LEAD_PARA`/`nest` place them as stycken of the § above
+            for li in el.find_all("li"):
+                if not li.find("li") and (item := " ".join(li.get_text(" ", strip=True).split())):
+                    paras.append(Para(item))
+            continue
+        paras.append(Para(text, bold=el.name != "p",
+                          size={"h2": 3, "h3": 2, "h4": 1}.get(el.name, 0)))
+    flush()
+
+
+def _parse_ea(box, identifier, fs, base_ars, base_lop, parser):
+    """An EA-regelverket page's typed sections -> the same (structure, footnotes,
+    konsolideradTom, amendment triples) contract as :func:`parse_consolidation`.
+
+    Statskontoret publishes STKFA and ESVFA as a website and not as PDFs, so the
+    page *is* the consolidated regulation (:mod:`statskontoret`). Its text is
+    already typed -- ``div.foreskrifter`` is binding, ``div.allmanna-rad`` is the
+    advisory text under the provision it explains -- which is the one
+    distinction `_group_allmanna_rad` has to infer from type size in a PDF.
+
+    The amendments folded in are named by the page's own Övergångsbestämmelser
+    section, one ``h3`` per amending författning, which is the same evidence a
+    konsoliderad PDF's masthead gives (:func:`masthead_amendments`)."""
+    blocks, amendments = [], []
+    for section in box.select(EA_SECTIONS):
+        heading = section.find(["h2", "h3", "h4"])
+        if heading is not None and RE_EA_OVERGANG.match(
+                " ".join(heading.get_text(" ", strip=True).split())):
+            amendments.append(section.get_text(" ", strip=True))
+            continue
+        section_blocks = []
+        _ea_blocks(section, section_blocks)
+        if not section_blocks:
+            continue
+        if "allmanna-rad" not in section.get("class", []):
+            blocks.extend(section_blocks)
+            continue
+        # the råd's own heading names the provision it explains ("Allmänna råd
+        # till 1 kap. 1 § förordningen"), which is what links the two
+        heading = (section_blocks.pop(0).text
+                   if section_blocks[0].kind == "rubrik" else "Allmänna råd")
+        assert section_blocks, "%s: an allmänna råd section with no text" % identifier
+        blocks.append(Block("allmanna_rad", heading, children=section_blocks))
+    _rank_rubriker(blocks, 0)
+    refs = masthead_amendments(" ".join(amendments), fs, base_ars, base_lop)
+    # the amendment's own series, not this record's: an ESVFA regulation is
+    # amended by STKFA now that Statskontoret issues the series (`_series_family`)
+    tom = (regulation_uri(_fs_key(refs[-1][0]), refs[-1][1], refs[-1][2])
+           if refs else None)
+    # the page has no page-foot rule, so it carries no footnotes
+    return _structure(blocks, parser), [], tom, refs
+
+
+def parse_consolidation_html(path, parser, identifier=None, fs=None,
+                             base_ars=None, base_lop=None):
     """A consolidated HTML page -> the same (structure, footnotes,
     konsolideradTom, masthead refs) contract as :func:`parse_consolidation`.
 
-    Two agencies publish a konsoliderad version as a page rather than a PDF, and
-    both pages are regular: an h1 page title, a few preamble lines, then h2/h3
-    headings over ``p``/``li`` body text -- headings classify as bold
-    paragraphs, everything else by its textual ``N §``/``N kap.`` markers.
-    Socialstyrelsen renders the text as the page's ``<main>``;
+    Three agencies publish a konsoliderad version as a page rather than a PDF.
+    Two of the three pages are regular prose: an h1 page title, a few preamble
+    lines, then h2/h3 headings over ``p``/``li`` body text -- headings classify
+    as bold paragraphs, everything else by its textual ``N §``/``N kap.``
+    markers. Socialstyrelsen renders the text as the page's ``<main>``;
     Folkhälsomyndighetens ``?pub=`` view renders it into a publication reader
     (``div.pubr-reader-body``) whose own ``<main>`` wraps that reader, and
-    closes with a list of the printed PDFs that is not text of the act."""
+    closes with a list of the printed PDFs that is not text of the act.
+
+    Statskontoret's EA-regelverket page states in markup what those two leave to
+    the prose -- which text binds and which is advisory -- so a page carrying
+    those typed sections is read by `_parse_ea` instead. The shape decides, not
+    the samling: this is the same content test that tells the reader view from
+    the plain page above."""
     # through `compress`: a live harvest stores the page brotli-compressed like
     # every other download, while the frozen SOSFS/HSLF-FS import wrote it plain
     soup = BeautifulSoup(compress.read_text(path), "html.parser")
     body = soup.select_one("div.pubr-reader-body") or soup.select_one("main")
     if body is None:
         raise ValueError("no consolidated text in konsoliderad page %s" % path)
+    if body.select_one(EA_SECTIONS) is not None:
+        assert fs and base_ars and base_lop, (
+            "%s is an EA-regelverket page, which needs its own designation to "
+            "read its amendments" % path)
+        return _parse_ea(body, identifier, fs, base_ars, base_lop, parser)
     paras, refs = [], []
     for el in body.find_all(["h2", "h3", "h4", "p", "li"]):
         if el.find_parent(["p", "li"]):
@@ -1500,7 +1644,8 @@ def parse_record(record, root):
             path = Path(root) / fs / cons["name"]
             cstruct, cnotes, tom, refs = (
                 parse_consolidation_html(
-                    path, sfs_parser("foreskrift", PARSE_TYPES, written=cons_written))
+                    path, sfs_parser("foreskrift", PARSE_TYPES, written=cons_written),
+                    record["identifier"], fs, arsutgava, lopnummer)
                 if path.suffix == ".html"
                 else parse_consolidation(path, record["identifier"],
                                          fs, arsutgava, lopnummer,
