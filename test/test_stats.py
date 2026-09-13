@@ -834,3 +834,72 @@ def _legislation_catalog(tmp_path):
     return path
 
 
+
+
+def _delegation_catalog():
+    """A catalog holding the four cases measure 57 has to get right."""
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE documents (uri TEXT, source TEXT, kind TEXT, "
+                "title TEXT, expired TEXT)")
+    con.execute("CREATE TABLE links (from_uri TEXT, predicate TEXT, "
+                "to_uri TEXT, to_root TEXT)")
+    con.executemany("INSERT INTO documents VALUES (?, ?, ?, ?, ?)", [
+        ("f1", "foreskrift", "afs", "AFS 1:1", None),
+        ("f2", "foreskrift", "afs", "AFS 1:2", None),
+        ("f3", "foreskrift", "afs", "AFS 1:3", None),
+        ("fo", "sfs", "forordning", "Testförordning (2001:1)", None),
+        ("lag", "sfs", "lag", "Testlag (2001:2)", None),
+        ("gammal", "sfs", "forordning", "Upphävd förordning (1990:1)", "1999-01-01"),
+        ("sen", "sfs", "forordning", "Framtida förordning (2001:3)", "2999-01-01"),
+    ])
+    con.executemany("INSERT INTO links VALUES (?, ?, ?, ?)", [
+        ("f1", "rpubl:bemyndigande", "fo#P3", "fo"),
+        ("f1", "rpubl:bemyndigande", "fo#P4", "fo"),   # same föreskrift, one act
+        ("f2", "rpubl:bemyndigande", "fo#P3", "fo"),
+        ("f2", "rpubl:bemyndigande", "lag#K2P1", "lag"),   # stands on both
+        ("f3", "rpubl:bemyndigande", "gammal#P1", "gammal"),
+        ("f3", "rpubl:bemyndigande", "sen#P1", "sen"),
+        ("fo", "rpubl:bemyndigande", "lag#K1P1", "lag"),   # not a föreskrift
+        ("f1", "dcterms:references", "fo#P9", "fo"),       # not a bemyndigande
+    ])
+    return con
+
+
+def test_the_delegation_count_is_distinct_in_the_foreskrift():
+    # f1 names two provisions of one förordning and is one föreskrift, not two.
+    # f2 stands on both a förordning and a lag, so the two kinds sum past the
+    # total -- which is why the lede says "somliga på båda" instead of
+    # presenting the split as a partition.
+    con = _delegation_catalog()
+    # four förordning links (f1 twice, f2, f3) over three föreskrifter
+    assert compute._delegated(con, "forordning") == 3
+    assert compute._delegated(con, "lag") == 1             # f2
+    assert compute._delegated(con) == 3                    # not 4: f2 is one
+
+
+def test_a_repealed_act_empowers_nothing_but_a_future_repeal_still_does():
+    # f3's two bemyndiganden are a förordning repealed in 1999 and one
+    # repealed in 2999. The first cannot empower anything today; the second is
+    # law until then (`in_force`), so f3 is counted once, not twice or never.
+    con = _delegation_catalog()
+    assert [(r.label, r.value) for r in
+            compute._delegation_rows(con, "forordning", "Förordningar")] == [
+        ("Testförordning (2001:1)", 2), ("Framtida förordning (2001:3)", 1)]
+
+
+def test_an_sfs_bemyndigandeupplysning_is_not_a_foreskrift():
+    # a förordning citing the lag that empowers it mints the same predicate.
+    # Counting it would put a document that is not a föreskrift into a measure
+    # whose unit is föreskrifter (135 SFS documents do this in the real corpus).
+    con = _delegation_catalog()
+    rows = compute._delegation_rows(con, "lag", "Lagar")
+    assert [(r.label, r.value) for r in rows] == [("Testlag (2001:2)", 1)]
+
+
+def test_the_detail_names_the_provision_that_carries_the_delegation():
+    # fo#P3 is named by two föreskrifter and fo#P4 by one, so the detail is
+    # P3's pinpoint and its own count -- not the act's row total.
+    con = _delegation_catalog()
+    rows = compute._delegation_rows(con, "forordning", "Förordningar")
+    assert rows[0].detail == "oftast 3 § (2)"
+    assert rows[0].group == "Förordningar"

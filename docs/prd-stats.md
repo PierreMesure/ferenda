@@ -11,6 +11,9 @@ Varje post nedan har **var siffran kommer ifrån** och en **status**:
   att den kräver en genomsökning av hela artefaktträdet).
 - **⚠ kräver ändring** — datat finns inte där en `stats`-källa får läsa det;
   se "Vad som saknas" nedan.
+- **✗ går inte att mäta** — frågan kräver en uppgift korpusen inte bär, och
+  ingen ändring av `stats` kan skaffa den. Posten står kvar med skälet, så att
+  den inte föreslås igen.
 
 Alla mätta siffror är från korpusen som den såg ut 2026-07-27.
 
@@ -502,9 +505,12 @@ lagtext — hur mycket av en ny lag som egentligen är gammal.
 De 323 463 hänvisningarna från domar till SFS, aggregerade per paragraf —
 och uppdelat per domstol, så man ser HD:s och HFD:s helt olika kartor.
 
-**45. Namngivna rättsfall** ○
-Andelen avgöranden som har fått ett namn (`lib/casenaming`), över tid.
-Namngivningen är en relativt ny HD-praxis och kurvan borde synas tydligt.
+**45. Namngivna rättsfall** ✗ *(går inte att mäta)*
+Andelen avgöranden som har fått ett namn (`lib/casenaming`), över tid. Måttet
+kräver den tidpunkt då namnet sattes, och den har vi inte: för äldre rättsfall
+är namnet satt långt efter att avgörandet publicerades, så publiceringsdatumet
+svarar på en annan fråga. Utan namngivningsdatum blir kurvan en bild av när
+domarna meddelades, inte av när HD började namnge dem.
 
 **46. Längsta och kortaste avgörandet** ○
 Teckenantal per avgörande. Både "vilken dom är en bok" och "vilket referat
@@ -519,10 +525,15 @@ Teckenantal per avgörande. Både "vilken dom är en bok" och "vilket referat
 > Skolverket 3 183 · Transportstyrelsen 1 115 · Jordbruksverket 803 ·
 > Socialstyrelsen 582 · Skatteverket 577 · Riksarkivet 447
 
-**48. Bemyndigandekedjan** ○
-Vilken lag har bemyndigat flest myndighetsföreskrifter? Datat finns som
-9 027 `rpubl:bemyndigande`-länkar — en fin bild av var i lagstiftningen
-den delegerade normgivningen faktiskt sitter.
+**48. Bemyndigandekedjan** ✔ *(mått 57)*
+Vilken författning har bemyndigat flest myndighetsföreskrifter?
+> **7 287** föreskrifter står på ett bemyndigande i en gällande författning.
+> **7 100** av dem pekar på en förordning och **398** på en lag — den
+> delegerade normgivningen delegeras av regeringen, inte av riksdagen.
+> Störst: gymnasieförordningen (2010:2039) med 1 312 föreskrifter, varav
+> 1 075 på 1 kap. 4 §. Sedan förordningen om vuxenutbildning 1 182 och
+> arkivförordningen 366. Störst bland lagarna: offentlighets- och
+> sekretesslagen 68, miljöbalken 61.
 
 **49. Direktiven som satt djupast spår i svensk rätt** ✔
 > Mervärdesskattedirektivet (2006/112/EG) genomförs i **520** svenska
